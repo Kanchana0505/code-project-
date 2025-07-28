@@ -1,0 +1,152 @@
+clc; clear;
+
+%% PARAMETERS
+scale = 1e5;
+lat = [21.24987208329769, 21.25807802569907];
+lon = [81.60473512913642, 81.57956938003011];
+
+% Obstacles
+rng(42); numObs = 20;
+obsLat = linspace(lat(1), lat(2), numObs)' + 0.00015 * randn(numObs,1);
+obsLon = linspace(lon(1), lon(2), numObs)' + 0.00015 * randn(numObs,1);
+obsAlt = 20 + 30 * rand(numObs,1);
+obstacles = [obsLat*scale, obsLon*scale, obsAlt];
+obsRadius = 60;
+
+%% START AND GOAL POINT SETUP
+start = [lat(1)*scale, lon(1)*scale, 0];        % Start from ground
+goal  = [lat(2)*scale, lon(2)*scale, 30];       % Goal at rooftop
+goalGround = [goal(1:2), 0];                    % Ground projection of goal
+
+%% RRT* PATH PLANNING
+stepSize = 100; maxIter = 3000; goalRadius = 80;
+nodes(1).pos = start; nodes(1).parent = 0; nodes(1).cost = 0;
+goalReached = false; goalIdx = -1;
+
+for iter = 1:maxIter
+    if rand < 0.3
+        q_rand = goal;
+    else
+        x = min(start(1),goal(1)) + rand * abs(diff([start(1),goal(1)]));
+        y = min(start(2),goal(2)) + rand * abs(diff([start(2),goal(2)]));
+        z = 20 + 20 * rand;
+        q_rand = [x, y, z];
+    end
+    allNodes = reshape([nodes.pos],3,[])';
+    [~, idx] = min(vecnorm(allNodes - q_rand, 2, 2));
+    q_near = nodes(idx).pos;
+    dir = (q_rand - q_near) / norm(q_rand - q_near);
+    q_new = q_near + stepSize * dir;
+    if ~collisionCheck(q_new, obstacles, obsRadius)
+        newNode.pos = q_new;
+        newNode.parent = idx;
+        newNode.cost = nodes(idx).cost + norm(q_new - q_near);
+        nodes(end+1) = newNode;
+        if norm(q_new - goal) < goalRadius
+            goalReached = true; goalIdx = length(nodes); break;
+        end
+    end
+end
+
+rrt_path = [];
+if goalReached
+    newNode.pos = goal;
+    newNode.parent = goalIdx;
+    newNode.cost = nodes(goalIdx).cost + norm(goal - nodes(goalIdx).pos);
+    nodes(end+1) = newNode;
+    idx = length(nodes);
+    while idx > 0
+        rrt_path = [nodes(idx).pos; rrt_path];
+        idx = nodes(idx).parent;
+    end
+    rrt_path = [rrt_path; goal(1:2), 0];
+else
+    error('❌ Goal not reached by RRT*.');
+end
+
+%% SMOOTH RRT* TRAJECTORY
+smooth_path = [];
+for i = 1:size(rrt_path,1)-1
+    p0 = rrt_path(i,:); p1 = rrt_path(i+1,:);
+    t = linspace(0,1,20)';
+    a0 = p0; a3 = 10*(p1-p0); a4 = -15*(p1-p0); a5 = 6*(p1-p0);
+    segment = a0 + a3.*t.^3 + a4.*t.^4 + a5.*t.^5;
+    smooth_path = [smooth_path; segment];
+end
+
+%% APF ON SMOOTHED PATH
+stepSize = 50; repRadius = 60; k_att = 1.5; k_rep = 5000;
+threshold = 30; maxSteps = 1000;
+pos = smooth_path(1,:); path_apf = pos;
+
+for i = 1:maxSteps
+    F_att = k_att * (goal - pos); F_rep = [0, 0, 0];
+    for j = 1:numObs
+        diff = pos - obstacles(j,:);
+        dist = norm(diff);
+        if dist < repRadius && dist > 1e-3
+            F_rep = F_rep + k_rep * ((1/dist - 1/repRadius) / dist^2) * (diff/dist);
+        end
+    end
+    F_total = F_att + F_rep;
+    if any(isnan(F_total)) || norm(F_total) < 1e-3, break; end
+    pos = pos + stepSize * F_total / norm(F_total);
+    path_apf = [path_apf; pos];
+    if norm(pos - goal) < threshold, break; end
+end
+path_apf = [path_apf; goal; goalGround];
+
+%% CONVERT TO GEOGRAPHIC COORDINATES
+lat_rrt   = rrt_path(:,1)   / scale;
+lon_rrt   = rrt_path(:,2)   / scale;
+alt_rrt   = rrt_path(:,3);
+
+lat_smooth = smooth_path(:,1) / scale;
+lon_smooth = smooth_path(:,2) / scale;
+alt_smooth = smooth_path(:,3);
+
+lat_apf   = path_apf(:,1)   / scale;
+lon_apf   = path_apf(:,2)   / scale;
+alt_apf   = path_apf(:,3);
+
+obsLatG = obstacles(:,1) / scale;
+obsLonG = obstacles(:,2) / scale;
+obsAltG = obstacles(:,3);
+
+%% UI LAYOUT
+fUI = uifigure('Name','Enhanced UAV Paths','Position',[100 100 1500 600]);
+grid = uigridlayout(fUI, [1, 3]);
+grid.ColumnWidth = {'1x','1x','1x'};
+
+p1 = uipanel(grid, 'Title', 'RRT* Path');
+p2 = uipanel(grid, 'Title', 'APF Path');
+p3 = uipanel(grid, 'Title', 'Hybrid: RRT* + APF');
+
+g1 = geoglobe(p1); g2 = geoglobe(p2); g3 = geoglobe(p3);
+latCenter = mean(lat); lonCenter = mean(lon); campos(g1, latCenter, lonCenter, 500);
+campos(g2, latCenter, lonCenter, 500); campos(g3, latCenter, lonCenter, 500);
+
+%% FUNCTION TO PLOT COMMON MARKERS
+plotCommon = @(g) [
+    geoplot3(g, lat(1), lon(1), 0, 'o', 'MarkerSize',10, 'LineWidth',2, 'Color','g', 'HeightReference','terrain'); % Start
+    geoplot3(g, lat(2), lon(2), 0, 'o', 'MarkerSize',10, 'LineWidth',2, 'Color','r', 'HeightReference','terrain'); % Goal
+    geoplot3(g, obsLatG, obsLonG, obsAltG, 'o', 'MarkerSize', 8, 'LineWidth', 1.5, 'Color','y', 'HeightReference','terrain');
+];
+
+%% PANEL 1: RRT*
+plotCommon(g1);
+geoplot3(g1, lat_rrt, lon_rrt, alt_rrt, '-', 'Color','m', 'LineWidth',2.5, 'HeightReference','terrain');
+
+%% PANEL 2: APF
+plotCommon(g2);
+geoplot3(g2, lat_apf, lon_apf, alt_apf, '-', 'Color','b', 'LineWidth',2.5, 'HeightReference','terrain');
+
+%% PANEL 3: Hybrid
+plotCommon(g3);
+geoplot3(g3, lat_smooth, lon_smooth, alt_smooth, '-', 'Color',[1 0.5 0], 'LineWidth',2.5, 'HeightReference','terrain'); % orange
+geoplot3(g3, lat_apf, lon_apf, alt_apf, '-', 'Color','c', 'LineWidth',2, 'HeightReference','terrain'); % cyan
+
+%% COLLISION CHECK FUNCTION
+function flag = collisionCheck(pt, obs, rad)
+    flag = any(vecnorm(obs - pt, 2, 2) < rad);
+end
