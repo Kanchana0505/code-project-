@@ -1,0 +1,250 @@
+clc; clear; close all;
+
+%% 1. Create Maze Map with Y range up to 100
+map = binaryOccupancyMap(100, 100, 1);
+inflate(map, 0.5);
+
+% Outer borders
+setOccupancy(map, [5 5; 5 95; 95 95; 95 5], 1);
+
+% Vertical walls
+for x = 15:10:85
+    yRange = 6:94;
+    if mod(x, 20) == 0
+        yRange = [6:30 36:94];
+    end
+    xCoord = x * ones(size(yRange));
+    setOccupancy(map, [xCoord' yRange'], 1);
+end
+
+% Horizontal walls
+for y = 10:10:90
+    xRange = 10:5:90;
+    if mod(y, 20) == 0
+        xRange = [10:35 55:90];
+    end
+    yCoord = y * ones(size(xRange));
+    setOccupancy(map, [xRange' yCoord'], 1);
+end
+
+% Box Obstacles
+boxes = [30 10; 35 50; 45 80; 50 22; 65 60; 75 40; 80 90; 60 70];
+for i = 1:size(boxes,1)
+    [bx, by] = meshgrid(boxes(i,1):boxes(i,1)+2, boxes(i,2):boxes(i,2)+2);
+    setOccupancy(map, [bx(:), by(:)], 1);
+end
+
+%% 2. Define Start & Goal
+start = [8 8];
+goal = [90 88];                 % ✅ Moved away from blocked 90,90
+setOccupancy(map, goal, 0);     % ✅ Clear cell to make sure it's reachable
+
+startIdx = round(start);
+goalIdx = round(goal);
+
+%% 3. A* Search
+cameFrom = containers.Map;
+visited = zeros(map.GridSize);
+gScore = inf(map.GridSize);
+fScore = inf(map.GridSize);
+openList = [heuristic(startIdx, goalIdx), startIdx];
+gScore(startIdx(2), startIdx(1)) = 0;
+fScore(startIdx(2), startIdx(1)) = heuristic(startIdx, goalIdx);
+neighbors = [-1 0; 1 0; 0 -1; 0 1; -1 -1; -1 1; 1 -1; 1 1];
+expandedNodes = [];
+found = false;
+
+while ~isempty(openList)
+    [~, idx] = min(openList(:,1));
+    current = openList(idx, 2:3);
+    openList(idx,:) = [];
+
+    cx = current(1); cy = current(2);
+    if visited(cy, cx), continue; end
+    visited(cy, cx) = 1;
+    expandedNodes = [expandedNodes; current];
+
+    if all(current == goalIdx)
+        found = true; break;
+    end
+
+    for i = 1:size(neighbors,1)
+        nx = cx + neighbors(i,1);
+        ny = cy + neighbors(i,2);
+        if nx < 1 || ny < 1 || nx > map.GridSize(2) || ny > map.GridSize(1), continue; end
+        if visited(ny, nx) || checkOccupancy(map, [nx ny]), continue; end
+        stepCost = norm([nx - cx, ny - cy]);
+        tentative_g = gScore(cy, cx) + stepCost;
+
+        if tentative_g < gScore(ny, nx)
+            gScore(ny, nx) = tentative_g;
+            fScore(ny, nx) = tentative_g + heuristic([nx, ny], goalIdx);
+            openList = [openList; fScore(ny,nx), nx, ny];
+            cameFrom(pos2key([nx ny])) = [cx cy];
+        end
+    end
+end
+
+if ~found
+    error('A* failed to find a path to the goal. Try adjusting map or goal.');
+end
+
+pathAStar = goalIdx;
+while true
+    key = pos2key(pathAStar(1,:));
+    if isKey(cameFrom, key)
+        pathAStar = [cameFrom(key); pathAStar];
+    else
+        break;
+    end
+end
+
+%% 4. RRT* Algorithm (Improved for larger map)
+maxNodes = 12000;
+stepSize = 2.5;
+searchRadius = 10.0;
+goalThreshold = 5.0;
+rng(99);
+
+nodes = start;
+parents = 0;
+costs = 0;
+goalIdxRRT = -1;
+
+for k = 1:maxNodes
+    if rand < 0.1
+        sample = goal;
+    elseif rand < 0.25
+        sample = [60 + rand*30, 20 + rand*60];
+    else
+        sample = [rand()*100, rand()*100];
+    end
+
+    dists = vecnorm(nodes - sample, 2, 2);
+    [~, nearIdx] = min(dists);
+    nearest = nodes(nearIdx, :);
+    direction = sample - nearest;
+    if norm(direction) == 0, continue; end
+    direction = direction / norm(direction);
+    newNode = nearest + stepSize * direction;
+
+    if any(newNode < [0 0]) || any(newNode > [100 100]), continue; end
+    if ~isMotionValid(map, nearest, newNode, 0.5), continue; end
+
+    nearby = find(vecnorm(nodes - newNode, 2, 2) < searchRadius);
+    bestCost = inf; bestParent = -1;
+    for i = nearby'
+        if isMotionValid(map, nodes(i,:), newNode, 0.5)
+            tempCost = costs(i) + norm(nodes(i,:) - newNode);
+            if tempCost < bestCost
+                bestCost = tempCost; bestParent = i;
+            end
+        end
+    end
+    if bestParent == -1, continue; end
+    nodes(end+1,:) = newNode;
+    parents(end+1) = bestParent;
+    costs(end+1) = bestCost;
+
+    newIdx = size(nodes,1);
+    for i = nearby'
+        if i == bestParent, continue; end
+        newCost = costs(newIdx) + norm(nodes(newIdx,:) - nodes(i,:));
+        if newCost < costs(i) && ...
+           isMotionValid(map, nodes(i,:), nodes(newIdx,:), 0.5)
+            parents(i) = newIdx;
+            costs(i) = newCost;
+        end
+    end
+
+    if norm(newNode - goal) < goalThreshold && ...
+       isMotionValid(map, newNode, goal, 0.5)
+        goalIdxRRT = size(nodes,1) + 1;
+        nodes(goalIdxRRT,:) = goal;
+        parents(goalIdxRRT) = newIdx;
+        costs(goalIdxRRT) = costs(newIdx) + norm(newNode - goal);
+        break;
+    end
+end
+
+if goalIdxRRT == -1
+    error('RRT* failed to find path to goal. Try increasing maxNodes or search radius.');
+end
+
+pathRRT = nodes(goalIdxRRT,:);
+p = goalIdxRRT;
+while parents(p) ~= 0
+    p = parents(p);
+    pathRRT = [nodes(p,:); pathRRT];
+end
+
+%% 5. Final Visualization
+figure('Name','A* vs RRT* vs Hybrid Comparison','Position',[100 100 1800 700]);
+tiledlayout(1, 3, 'Padding', 'compact', 'TileSpacing', 'compact');
+
+% --- A* Plot ---
+nexttile;
+show(map); hold on; axis([0 100 0 100]);
+title('A* Pathfinding','FontSize',14); xlabel('X'); ylabel('Y');
+plot(expandedNodes(:,1), expandedNodes(:,2), 'k.', 'MarkerSize', 4);
+keys = cameFrom.keys;
+for i = 1:length(keys)
+    child = str2num(keys{i});
+    parent = cameFrom(keys{i});
+    plot([parent(1), child(1)], [parent(2), child(2)], 'b-', 'LineWidth', 0.5);
+end
+plot(pathAStar(:,1), pathAStar(:,2), 'r-', 'LineWidth', 2);
+plot(start(1), start(2), 'go', 'MarkerSize', 10, 'LineWidth', 2);
+plot(goal(1), goal(2), 'bx', 'MarkerSize', 10, 'LineWidth', 2);
+legend({'Visited','A* Tree','A* Path','Start','Goal'}, 'Location','best');
+
+% --- RRT* Plot ---
+nexttile;
+show(map); hold on; axis([0 100 0 100]);
+title('RRT* Pathfinding','FontSize',14); xlabel('X'); ylabel('Y');
+for i = 2:size(nodes,1)
+    p = parents(i);
+    if p > 0
+        plot([nodes(i,1), nodes(p,1)], [nodes(i,2), nodes(p,2)], ...
+            'Color', [1 0.6 0], 'LineWidth', 0.4);
+    end
+end
+scatter(nodes(:,1), nodes(:,2), 5, 'k', 'filled');
+plot(pathRRT(:,1), pathRRT(:,2), 'r-', 'LineWidth', 2);
+plot(start(1), start(2), 'go', 'MarkerSize', 10, 'LineWidth', 2);
+plot(goal(1), goal(2), 'bx', 'MarkerSize', 10, 'LineWidth', 2);
+legend({'RRT* Tree','Nodes','RRT* Path','Start','Goal'}, 'Location','best');
+
+% --- Hybrid Comparison ---
+nexttile;
+show(map); hold on; axis([0 100 0 100]);
+title('Hybrid: A* vs RRT*','FontSize',14); xlabel('X'); ylabel('Y');
+plot(pathAStar(:,1), pathAStar(:,2), 'b-', 'LineWidth', 2);
+plot(pathRRT(:,1), pathRRT(:,2), 'm--', 'LineWidth', 2);
+plot(start(1), start(2), 'go', 'MarkerSize', 10, 'LineWidth', 2);
+plot(goal(1), goal(2), 'rx', 'MarkerSize', 10, 'LineWidth', 2);
+legend({'A* Path','RRT* Path','Start','Goal'}, 'Location','best');
+
+%% --- Helper Functions
+function h = heuristic(a, b)
+    h = norm(a - b);
+end
+
+function key = pos2key(p)
+    key = sprintf('%d,%d', p(1), p(2));
+end
+
+function valid = isMotionValid(map, p1, p2, step)
+    vec = p2 - p1;
+    dist = norm(vec);
+    if dist == 0, valid = true; return; end
+    dir = vec / dist;
+    pts = p1 + (0:step:dist)' * dir;
+    for i = 1:size(pts,1)
+        if checkOccupancy(map, pts(i,:))
+            valid = false; return;
+        end
+    end
+    valid = true;
+end
+
