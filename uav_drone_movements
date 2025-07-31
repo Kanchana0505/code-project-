@@ -1,0 +1,112 @@
+function combinedDroneUAV(urgency, distanceKm, needsColdChain, startCity, endCity)
+    %% --- Drone Selection Section ---
+    % Drone data
+    droneNames = {'Wingcopter 198', 'Zipline P2 Zip', 'Redwing Labhawk', ...
+                  'Matternet M2', 'Sagar MedCOPTER', 'TechEagle X3'};
+    droneRanges = [75, 130, 60, 20, 15, 100];      % km
+    droneSpeeds = [150, 120, 100, 80, 60, 120];    % km/h
+    droneColdChain = [true, true, true, true, false, true];
+    droneUseType = {'emergency', 'emergency', 'routine', 'routine', 'routine', 'emergency'};
+
+    % Filter drones by criteria
+    suitableIdx = [];
+    for i = 1:length(droneNames)
+        if strcmp(droneUseType{i}, urgency) && ...
+           droneRanges(i) >= distanceKm && ...
+           (~needsColdChain || droneColdChain(i))
+            suitableIdx(end+1) = i; %#ok<AGROW>
+        end
+    end
+
+    if isempty(suitableIdx)
+        fprintf('No suitable drone found.\n');
+        return;
+    end
+
+    % Select fastest drone among suitable
+    [~, maxIdx] = max(droneSpeeds(suitableIdx));
+    chosenIdx = suitableIdx(maxIdx);
+
+    fprintf('Selected Drone: %s\n', droneNames{chosenIdx});
+    fprintf('Range: %d km\n', droneRanges(chosenIdx));
+    fprintf('Speed: %d km/h\n', droneSpeeds(chosenIdx));
+    fprintf('Cold Chain Support: %s\n\n', mat2str(droneColdChain(chosenIdx)));
+
+    UAV_speed = droneSpeeds(chosenIdx) / 3.6; % Convert km/h to m/s for time calc
+
+    %% --- City and Path Planning Section ---
+    % Offline city database
+    cityDB = struct( ...
+        'Raipur', struct('Lat', 21.2514, 'Lon', 81.6296, 'State', 'Chhattisgarh'), ...
+        'Bhilai', struct('Lat', 21.1938, 'Lon', 81.3509, 'State', 'Chhattisgarh'), ...
+        'Delhi', struct('Lat', 28.6139, 'Lon', 77.2090, 'State', 'Delhi'), ...
+        'Mumbai', struct('Lat', 19.0760, 'Lon', 72.8777, 'State', 'Maharashtra'), ...
+        'Chennai', struct('Lat', 13.0827, 'Lon', 80.2707, 'State', 'Tamil Nadu'), ...
+        'Kolkata', struct('Lat', 22.5726, 'Lon', 88.3639, 'State', 'West Bengal') ...
+    );
+
+    % Validate city inputs
+    if ~isfield(cityDB, startCity) || ~isfield(cityDB, endCity)
+        error('One or both cities not found in database.');
+    end
+
+    % Extract coordinates and scale for spline calculations
+    startLoc = cityDB.(startCity);
+    endLoc = cityDB.(endCity);
+    lat = [startLoc.Lat, endLoc.Lat];
+    lon = [startLoc.Lon, endLoc.Lon];
+
+    scale = 1e5;
+    start_scaled = [lat(1)*scale, lon(1)*scale];
+    end_scaled = [lat(2)*scale, lon(2)*scale];
+
+    % Altitude options in meters
+    altRange = 20:10:100;
+
+    bestTime = inf;
+    bestAlt = 0;
+    bestPath = [];
+
+    % Find best cruise altitude minimizing flight time
+    for cruiseAltitude = altRange
+        mid_scaled = (start_scaled + end_scaled) / 2;
+        controlPoints = [start_scaled(1), mid_scaled(1), end_scaled(1); 
+                         start_scaled(2), mid_scaled(2), end_scaled(2); 
+                         0, cruiseAltitude, 0];
+
+        t = linspace(0, 1, 100);
+        path3D = [spline([0 0.5 1], controlPoints(1,:), t); 
+                  spline([0 0.5 1], controlPoints(2,:), t); 
+                  spline([0 0.5 1], controlPoints(3,:), t)]';
+
+        segment_lengths = vecnorm(diff(path3D), 2, 2);
+        totalDist = sum(segment_lengths);
+        flightTime = totalDist / UAV_speed;
+
+        if flightTime < bestTime || (abs(flightTime - bestTime) < 0.1 && cruiseAltitude < bestAlt)
+            bestTime = flightTime;
+            bestAlt = cruiseAltitude;
+            bestPath = path3D;
+        end
+    end
+
+    % Convert best path to lat, lon, altitude
+    bestLat = bestPath(:,1) / scale;
+    bestLon = bestPath(:,2) / scale;
+    bestAltitudes = bestPath(:,3);
+
+    %% --- Plotting Section ---
+    uif = uifigure;
+    g = geoglobe(uif);
+
+    geoplot3(g, lat, lon, [0 0], 'ro', 'MarkerSize', 10, 'LineWidth', 2, 'HeightReference', 'terrain');
+    geoplot3(g, bestLat, bestLon, bestAltitudes, 'g', 'LineWidth', 2.5, 'HeightReference', 'terrain');
+
+    %% --- Output Flight Info ---
+    fprintf("\nSpline-Based Optimal Path\n");
+    fprintf("From: %s, %s\n", startCity, startLoc.State);
+    fprintf("To  : %s, %s\n", endCity, endLoc.State);
+    fprintf("Best Cruise Altitude: %.2f meters\n", bestAlt);
+    fprintf("Total Distance: %.2f meters\n", totalDist);
+    fprintf("Least Flight Time: %.2f seconds (%.2f m/s)\n", bestTime, UAV_speed);
+end
